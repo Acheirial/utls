@@ -3,6 +3,7 @@
 package tls
 
 import (
+	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
@@ -12,6 +13,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -22,8 +24,10 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cloudflare/circl/sign/mldsa/mldsa65"
 	"github.com/metacubex/utls/internal/mlkem"
 	"github.com/metacubex/utls/internal/ratelimit"
+	"github.com/pires/go-proxyproto"
 
 	"golang.org/x/crypto/curve25519"
 	"golang.org/x/crypto/hkdf"
@@ -71,6 +75,7 @@ func (c *realityMirrorConn) SetWriteDeadline(t time.Time) error {
 
 const realitySize uint16 = 16384
 
+var realityEmpty = make([]byte, 17*1024)
 var realityTypes = [7]string{
 	"Server Hello",
 	"Change Cipher Spec",
@@ -100,8 +105,8 @@ type RealityConfig struct {
 	Log  func(format string, v ...any)
 	Type string
 	Dest string
-	Xver byte
-
+	Xver        byte
+	Mldsa65Key  []byte
 	ServerNames  map[string]bool
 	PrivateKey   []byte
 	MinClientVer []byte
@@ -122,6 +127,7 @@ func (a *RealityConfig) Clone() *RealityConfig {
 		Type:                  a.Type,
 		Dest:                  a.Dest,
 		Xver:                  a.Xver,
+		Mldsa65Key:            a.Mldsa65Key,
 		ServerNames:           a.ServerNames,
 		PrivateKey:            a.PrivateKey,
 		MinClientVer:          a.MinClientVer,
@@ -169,13 +175,14 @@ func newRateLimitedConn(conn net.Conn, limit *RealityLimitFallback) net.Conn {
 	}
 }
 
-func onceValues[T1, T2 any](f func() (T1, T2)) func() (T1, T2) {
+func onceValues3[T1, T2, T3 any](f func() (T1, T2, T3)) func() (T1, T2, T3) {
 	var (
 		once  sync.Once
 		valid bool
 		p     any
 		r1    T1
 		r2    T2
+		r3    T3
 	)
 	g := func() {
 		defer func() {
@@ -184,23 +191,25 @@ func onceValues[T1, T2 any](f func() (T1, T2)) func() (T1, T2) {
 				panic(p)
 			}
 		}()
-		r1, r2 = f()
+		r1, r2, r3 = f()
 		f = nil
 		valid = true
 	}
-	return func() (T1, T2) {
+	return func() (T1, T2, T3) {
 		once.Do(g)
 		if !valid {
 			panic(p)
 		}
-		return r1, r2
+		return r1, r2, r3
 	}
 }
 
-var realityServerCert = onceValues(func() (ed25519Priv ed25519.PrivateKey, signedCert []byte) {
+var realityServerCert = onceValues3(func() (ed25519Priv ed25519.PrivateKey, signedCert []byte, signedCertMldsa65 []byte) {
 	certificate := x509.Certificate{SerialNumber: &big.Int{}}
+	certificateMldsa65 := x509.Certificate{SerialNumber: &big.Int{}, ExtraExtensions: []pkix.Extension{{Id: []int{0, 0}, Value: realityEmpty[:3309]}}}
 	_, ed25519Priv, _ = ed25519.GenerateKey(rand.Reader)
 	signedCert, _ = x509.CreateCertificate(rand.Reader, &certificate, &certificate, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
+	signedCertMldsa65, _ = x509.CreateCertificate(rand.Reader, &certificateMldsa65, &certificateMldsa65, ed25519.PublicKey(ed25519Priv[32:]), ed25519Priv)
 	return
 })
 
@@ -269,15 +278,27 @@ func (hs *realityServerHandshakeStateTLS13) handshake() error {
 		}
 	*/
 	{
-		ed25519Priv, signedCert := realityServerCert()
-		signedCert = append([]byte{}, signedCert...)
+		ed25519Priv, signedCert, signedCertMldsa65 := realityServerCert()
+		var cert []byte
+		if len(config.Mldsa65Key) > 0 {
+			cert = append([]byte{}, signedCertMldsa65...)
+		} else {
+			cert = append([]byte{}, signedCert...)
+		}
 
 		h := hmac.New(sha512.New, hs.AuthKey)
 		h.Write(ed25519Priv[32:])
-		h.Sum(signedCert[:len(signedCert)-64])
+		h.Sum(cert[:len(cert)-64])
+
+		if len(config.Mldsa65Key) > 0 {
+			h.Write(hs.clientHello.original)
+			h.Write(hs.hello.original)
+			key, _ := mldsa65.Scheme().UnmarshalBinaryPrivateKey(config.Mldsa65Key)
+			mldsa65.SignTo(key.(*mldsa65.PrivateKey), h.Sum(nil), nil, false, cert[126:]) // fixed location
+		}
 
 		hs.cert = &Certificate{
-			Certificate: [][]byte{signedCert},
+			Certificate: [][]byte{cert},
 			PrivateKey:  ed25519Priv,
 		}
 		hs.sigAlg = Ed25519
@@ -352,6 +373,13 @@ func RealityServer(ctx context.Context, conn net.Conn, config *RealityConfig) (*
 	if err != nil {
 		conn.Close()
 		return nil, errors.New("REALITY: failed to dial dest: " + err.Error())
+	}
+	if config.Xver == 1 || config.Xver == 2 {
+		if _, err = proxyproto.HeaderProxyFromAddrs(config.Xver, conn.RemoteAddr(), conn.LocalAddr()).WriteTo(target); err != nil {
+			target.Close()
+			conn.Close()
+			return nil, errors.New("REALITY: failed to send PROXY protocol: " + err.Error())
+		}
 	}
 
 	underlying := conn
