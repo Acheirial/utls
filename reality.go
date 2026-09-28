@@ -3,7 +3,6 @@
 package tls
 
 import (
-	"bytes"
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
